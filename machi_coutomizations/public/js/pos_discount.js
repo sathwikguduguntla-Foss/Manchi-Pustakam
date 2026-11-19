@@ -1,8 +1,4 @@
-
 (function () {
-	const MIN_BILL_FOR_DISCOUNT = 100;
-	const get_sale_mode = () =>
-		localStorage.getItem("pos_sale_mode") === "Exhibition" ? "Exhibition" : "Store";
 	const page = frappe.pages["point-of-sale"];
 	if (!page || page.__machi_pos_extended) return;
 	page.__machi_pos_extended = true;
@@ -15,97 +11,104 @@
 		frappe.require("point-of-sale.bundle.js", () => {
 			const POS = erpnext.PointOfSale;
 
-			// Display the discount in cart totals.
+			// Change the payable rounded total, before payment amounts are calculated.
+			const totals = erpnext.taxes_and_totals.prototype;
+			if (!totals.__machi_truncate_pos_total) {
+				const standard_set_rounded_total = totals.set_rounded_total;
+				totals.set_rounded_total = function (...args) {
+					if (this.frm.doc.doctype !== "POS Invoice") {
+						return standard_set_rounded_total.apply(this, args);
+					}
+					const doc = this.frm.doc;
+					doc.disable_rounded_total = 0;
+					doc.rounded_total = Math.trunc(flt(doc.grand_total));
+					doc.rounding_adjustment = flt(
+						doc.rounded_total - flt(doc.grand_total),
+						precision("rounding_adjustment", doc)
+					);
+					this.set_in_company_currency(doc, ["rounding_adjustment", "rounded_total"]);
+				};
+				totals.__machi_truncate_pos_total = true;
+			}
+
+			// Show Total Cost and Discount, and truncate displayed Grand Total.
 			if (!POS.ItemCart.__machi_discount_extended) {
 				const ItemCart = POS.ItemCart;
 
 				POS.ItemCart = class extends ItemCart {
 					static __machi_discount_extended = true;
 
+
 					make_cart_totals_section() {
 						super.make_cart_totals_section();
-						this.make_sale_mode_panel();
+
+						this.$total_cost = $(`
+							<div class="machi-total-cost-row"
+								style="display:flex;justify-content:space-between;
+									align-items:center;margin-bottom:var(--margin-sm)">
+								<span>${__("Total Cost")}</span>
+								<span class="machi-total-cost-amount"></span>
+							</div>
+						`);
 
 						this.$discount_amount = $(`
-							<div style="display:flex;justify-content:space-between;
-								align-items:center;margin-bottom:var(--margin-sm)">
+							<div class="machi-discount-row"
+								style="display:flex;justify-content:space-between;
+									align-items:center;margin-bottom:var(--margin-sm)">
 								<span>${__("Discount")}</span>
 								<span class="machi-discount-amount"></span>
 							</div>
 						`);
 
-						this.$totals_section
-							.find(".item-qty-total-container")
-							.before(this.$discount_amount);
+						this.arrange_custom_totals();
 					}
 
-					make_sale_mode_panel() {
-						this.$sale_mode_panel = $(`
-							<div class="machi-sale-mode-panel" style="padding:12px;background:#e3f2fd;border-radius:6px;margin-bottom:12px">
-								<label>${__("POS Sale Mode")}
-									<select class="form-control">
-										<option value="Store">${__("Store Mode (10%)")}</option>
-										<option value="Exhibition">${__("Exhibition Mode (0%)")}</option>
-									</select>
-								</label>
-								<div>${__("Store discount applies only above ₹{0}.", [MIN_BILL_FOR_DISCOUNT])}</div>
-							</div>
-						`);
-						const $pos_app = this.$component.closest(".point-of-sale-app");
-						$pos_app.siblings(".machi-sale-mode-panel").remove();
-						$pos_app.before(this.$sale_mode_panel);
-						this.$sale_mode_panel.find("select").val(get_sale_mode()).on("change", (event) => {
-							localStorage.setItem("pos_sale_mode", event.target.value);
-							this.update_totals_section(this.events.get_frm());
-							frappe.show_alert({
-								message: __("Switched to {0} Mode", [get_sale_mode()]),
-								indicator: "green",
-							}, 3);
-						});
-					}
+					arrange_custom_totals() {
+						const $net_total = this.$totals_section
+							.find(".net-total-container")
+							.first();
 
-					apply_sale_mode_discount(frm) {
-						if (!frm?.doc || frm.doc.docstatus !== 0 || this.machi_applying_discount) return;
-						const doc = frm.doc;
-						const total = (doc.items || []).reduce(
-							(sum, item) => sum + flt(item.qty) * flt(item.rate), 0
-						) || flt(doc.total);
-						const discount = get_sale_mode() === "Store" && total > MIN_BILL_FOR_DISCOUNT ? 10 : 0;
-						if (flt(doc.additional_discount_percentage) === discount) return;
+						$net_total.hide();
 
-						this.machi_applying_discount = true;
-						let failed = false;
-						Promise.resolve().then(() => frm.set_value("additional_discount_percentage", discount))
-							.catch((error) => {
-								failed = true;
-								console.error("POS sale mode discount failed:", error);
-							})
-							.finally(() => {
-								this.machi_applying_discount = false;
-								if (!failed && this.events.get_frm() === frm) {
-									this.hide_discount_control(flt(doc.additional_discount_percentage));
-									this.update_totals_section(frm);
-								}
-							});
+						if (this.$total_cost && this.$discount_amount) {
+							this.$total_cost.insertAfter($net_total);
+							this.$discount_amount.insertAfter(this.$total_cost);
+						}
 					}
 
 					update_totals_section(frm) {
 						frm = frm || this.events.get_frm();
-						this.apply_sale_mode_discount(frm);
-						this.$sale_mode_panel?.find("select").val(get_sale_mode());
 						super.update_totals_section(frm);
-						if (!this.$discount_amount) return;
 
-						const doc = (frm || this.events.get_frm()).doc;
+						this.arrange_custom_totals();
 
-						this.$discount_amount
-							.find(".machi-discount-amount")
-							.text(
-								format_currency(
-									flt(doc.discount_amount),
-									doc.currency
-								)
-							);
+						const doc = frm.doc;
+
+						// Preserve decimal item rates in Total Cost.
+						const total_cost = (doc.items || []).reduce(
+							(total, item) =>
+								total + flt(item.qty) * flt(item.rate),
+							0
+						);
+
+						if (this.$total_cost) {
+							this.$total_cost
+								.find(".machi-total-cost-amount")
+								.text(
+									format_currency(total_cost, doc.currency)
+								);
+						}
+
+						if (this.$discount_amount) {
+							this.$discount_amount
+								.find(".machi-discount-amount")
+								.text(
+									format_currency(
+										flt(doc.discount_amount),
+										doc.currency
+									)
+								);
+						}
 					}
 				};
 			}
@@ -140,6 +143,7 @@
 						});
 
 						const $input = this.barcode_field.$input;
+
 						$input.attr("autocomplete", "off");
 						$input.css("padding-right", "40px");
 
